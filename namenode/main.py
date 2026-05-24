@@ -4,6 +4,7 @@ import sqlite3
 import uuid
 import random
 import os
+import asyncio
 from typing import List, Optional, Dict, Any
 
 from database import init_db, get_db_connection
@@ -17,6 +18,39 @@ BLOCK_SIZE_BYTES = BLOCK_SIZE_MB * 1024 * 1024
 @app.on_event("startup")
 def startup_event():
     init_db()
+    asyncio.create_task(self_healing_loop())
+
+async def self_healing_loop():
+    while True:
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT b.block_id, COUNT(bl.datanode_id) as replicas 
+                    FROM blocks b 
+                    LEFT JOIN block_locations bl ON b.block_id = bl.block_id 
+                    LEFT JOIN datanodes d ON bl.datanode_id = d.datanode_id AND d.status='ACTIVE' AND (strftime('%s', 'now') - strftime('%s', d.last_heartbeat)) < 30
+                    GROUP BY b.block_id 
+                    HAVING replicas < 2
+                """)
+                under_replicated = cursor.fetchall()
+                
+                for row in under_replicated:
+                    block_id = row["block_id"]
+                    cursor.execute("SELECT d.datanode_id, d.ip_address, d.port FROM block_locations bl JOIN datanodes d ON bl.datanode_id = d.datanode_id WHERE bl.block_id=? AND d.status='ACTIVE'", (block_id,))
+                    source = cursor.fetchone()
+                    if not source: continue
+                        
+                    cursor.execute("SELECT datanode_id FROM datanodes WHERE status='ACTIVE' AND (strftime('%s', 'now') - strftime('%s', last_heartbeat)) < 30 AND datanode_id NOT IN (SELECT datanode_id FROM block_locations WHERE block_id=?)", (block_id,))
+                    target = cursor.fetchone()
+                    if target:
+                        cursor.execute("CREATE TABLE IF NOT EXISTS replicate_cmds (block_id TEXT, source_url TEXT, target_datanode TEXT, PRIMARY KEY(block_id, target_datanode))")
+                        source_url = f"http://{source['ip_address']}:{source['port']}/blocks/{block_id}"
+                        cursor.execute("INSERT OR IGNORE INTO replicate_cmds (block_id, source_url, target_datanode) VALUES (?, ?, ?)", (block_id, source_url, target["datanode_id"]))
+                conn.commit()
+        except Exception as e:
+            print(f"Error en self healing: {e}")
+        await asyncio.sleep(30)
 
 @app.get("/health")
 def health_check():
