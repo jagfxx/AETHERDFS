@@ -4,6 +4,8 @@ import requests
 from typing import Dict, Optional
 
 NAMENODE_URL = os.environ.get("NAMENODE_URL", "http://localhost:8000")
+BLOCK_SIZE_MB = int(os.environ.get("BLOCK_SIZE_MB", 64))
+BLOCK_SIZE_BYTES = BLOCK_SIZE_MB * 1024 * 1024
 
 TOKEN: Optional[str] = None
 CURRENT_DIR = "/"
@@ -94,6 +96,46 @@ def cd(path):
     else:
         print(f"Directorio no existe: {full_path}")
 
+def put(local_path, remote_path):
+    if not os.path.exists(local_path):
+        print("Archivo local no existe.")
+        return
+        
+    file_size = os.path.getsize(local_path)
+    full_remote_path = resolve_path(remote_path)
+    
+    # 1. Asignar bloques
+    res = requests.post(f"{NAMENODE_URL}/files/allocate", json={"path": full_remote_path, "file_size": file_size}, headers=headers())
+    if res.status_code != 200:
+        print(f"Error asignando bloques: {res.json().get('detail')}")
+        return
+        
+    blocks = res.json()["blocks"]
+    print(f"Asignados {len(blocks)} bloques para {full_remote_path}.")
+    
+    # 2. Enviar los bloques
+    with open(local_path, "rb") as f:
+        for b in blocks:
+            data_chunk = f.read(BLOCK_SIZE_BYTES)
+            if not data_chunk:
+                break
+                
+            block_id = b["block_id"]
+            
+            # Subir al primario y al secundario directamente (el cliente se asegura de la replicación según el plan)
+            for node in [b["primary"], b["replica"]]:
+                target_url = f"http://{node['host']}:{node['port']}/blocks/{block_id}"
+                print(f"Subiendo bloque {block_id[:8]} a {node['host']}...")
+                try:
+                    # Usamos requests con files para enviar multipart
+                    upload_res = requests.post(target_url, files={"file": (block_id, data_chunk)})
+                    if upload_res.status_code != 200:
+                        print(f"Advertencia: Falló subida a {node['host']}.")
+                except Exception as e:
+                    print(f"Advertencia: Nodo {node['host']} inaccesible ({e}).")
+                    
+    print("Transferencia completada.")
+
 def print_help():
     print("""
 Comandos disponibles:
@@ -104,6 +146,7 @@ Comandos disponibles:
   mkdir <path>
   rmdir <path>
   rm <path>
+  put <local_file> <remote_path>
   help
   exit
 """)
@@ -129,6 +172,7 @@ def main():
             elif cmd == "mkdir" and len(args) == 1: mkdir(args[0])
             elif cmd == "rmdir" and len(args) == 1: rmdir(args[0])
             elif cmd == "rm" and len(args) == 1: rm(args[0])
+            elif cmd == "put" and len(args) == 2: put(args[0], args[1])
             else:
                 print("Comando inválido o argumentos incorrectos. Escribe 'help'.")
         except (EOFError, KeyboardInterrupt):
