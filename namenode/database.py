@@ -32,6 +32,7 @@ def init_db():
             name TEXT NOT NULL,
             is_dir BOOLEAN NOT NULL DEFAULT 0,
             size_bytes INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'READY',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(user_id) REFERENCES users(id),
             FOREIGN KEY(parent_id) REFERENCES files(id) ON DELETE CASCADE,

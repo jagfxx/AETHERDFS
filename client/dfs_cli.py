@@ -3,6 +3,7 @@ import os
 import requests
 import getpass
 import hashlib
+import concurrent.futures
 from typing import Dict, Optional
 
 NAMENODE_URL = os.environ.get("NAMENODE_URL", "http://localhost:8000")
@@ -107,7 +108,7 @@ def put(local_path, remote_path):
     file_size = os.path.getsize(local_path)
     full_remote_path = resolve_path(remote_path)
     
-    # 1. Asignar bloques
+    # 1. Asignar bloques (Fase 1: UPLOADING)
     res = requests.post(f"{NAMENODE_URL}/files/allocate", json={"path": full_remote_path, "file_size": file_size}, headers=headers())
     if res.status_code != 200:
         print(f"Error asignando bloques: {res.json().get('detail')}")
@@ -116,28 +117,51 @@ def put(local_path, remote_path):
     blocks = res.json()["blocks"]
     print(f"Asignados {len(blocks)} bloques para {full_remote_path}.")
     
-    # 2. Enviar los bloques
-    with open(local_path, "rb") as f:
-        for b in blocks:
-            data_chunk = f.read(BLOCK_SIZE_BYTES)
-            if not data_chunk:
-                break
-                
-            block_id = b["block_id"]
+    def upload_block_to_node(node, block_id, data_chunk):
+        target_url = f"http://{node['host']}:{node['port']}/blocks/{block_id}"
+        print(f"Subiendo bloque {block_id[:8]} a {node['host']}...")
+        try:
+            upload_res = requests.post(target_url, files={"file": (block_id, data_chunk)})
+            if upload_res.status_code != 200:
+                print(f"Advertencia: Falló subida a {node['host']}.")
+                return False
+            return True
+        except Exception as e:
+            print(f"Advertencia: Nodo {node['host']} inaccesible ({e}).")
+            return False
             
-            # Subir al primario y al secundario directamente (el cliente se asegura de la replicación según el plan)
-            for node in [b["primary"], b["replica"]]:
-                target_url = f"http://{node['host']}:{node['port']}/blocks/{block_id}"
-                print(f"Subiendo bloque {block_id[:8]} a {node['host']}...")
-                try:
-                    # Usamos requests con files para enviar multipart
-                    upload_res = requests.post(target_url, files={"file": (block_id, data_chunk)})
-                    if upload_res.status_code != 200:
-                        print(f"Advertencia: Falló subida a {node['host']}.")
-                except Exception as e:
-                    print(f"Advertencia: Nodo {node['host']} inaccesible ({e}).")
+    # 2. Enviar los bloques concurrentemente
+    with open(local_path, "rb") as f:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            block_futures = {}
+            for b in blocks:
+                data_chunk = f.read(BLOCK_SIZE_BYTES)
+                if not data_chunk:
+                    break
+                block_id = b["block_id"]
+                block_futures[block_id] = [
+                    executor.submit(upload_block_to_node, b["primary"], block_id, data_chunk),
+                    executor.submit(upload_block_to_node, b["replica"], block_id, data_chunk)
+                ]
+            
+            success = True
+            for block_id, futures in block_futures.items():
+                results = [future.result() for future in futures]
+                if not any(results):
+                    success = False
+                    break
                     
-    print("Transferencia completada.")
+    # 3. Commit (Fase 2: READY)
+    if success:
+        commit_res = requests.post(f"{NAMENODE_URL}/files/commit", json={"path": full_remote_path}, headers=headers())
+        if commit_res.status_code == 200:
+            print("Transferencia y commit completados exitosamente.")
+        else:
+            print(f"Error en commit: {commit_res.json().get('detail')}")
+            rm(remote_path)
+    else:
+        print("Error crítico: Falló la subida de un bloque a todas sus réplicas. Abortando.")
+        rm(remote_path)
 
 def get(remote_path, local_path):
     full_remote_path = resolve_path(remote_path)

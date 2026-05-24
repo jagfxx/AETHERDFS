@@ -141,9 +141,9 @@ def list_directory(req: PathReq, user_id: int = Depends(get_current_user_id)):
         parent_id = get_parent_dir_id(cursor, user_id, req.path)
         
         if parent_id is None:
-            cursor.execute("SELECT name, is_dir, size_bytes FROM files WHERE user_id=? AND parent_id IS NULL", (user_id,))
+            cursor.execute("SELECT name, is_dir, size_bytes FROM files WHERE user_id=? AND parent_id IS NULL AND status='READY'", (user_id,))
         else:
-            cursor.execute("SELECT name, is_dir, size_bytes FROM files WHERE user_id=? AND parent_id=?", (user_id, parent_id))
+            cursor.execute("SELECT name, is_dir, size_bytes FROM files WHERE user_id=? AND parent_id=? AND status='READY'", (user_id, parent_id))
         
         return [{"name": r["name"], "is_dir": bool(r["is_dir"]), "size": r["size_bytes"]} for r in cursor.fetchall()]
 
@@ -198,19 +198,19 @@ def allocate_blocks(req: AllocateReq, user_id: int = Depends(get_current_user_id
         cursor = conn.cursor()
         parent_id = get_parent_dir_id(cursor, user_id, parent_path)
         
-        # Verificar DataNodes vivos (heartbeat < 30 seg)
-        cursor.execute("SELECT datanode_id, ip_address, port FROM datanodes WHERE status='ACTIVE' AND (strftime('%s', 'now') - strftime('%s', last_heartbeat)) < 30")
+        # Verificar DataNodes vivos ordenados por espacio libre para balanceo
+        cursor.execute("SELECT datanode_id, ip_address, port FROM datanodes WHERE status='ACTIVE' AND (strftime('%s', 'now') - strftime('%s', last_heartbeat)) < 30 ORDER BY free_bytes DESC")
         active_datanodes = cursor.fetchall()
         
         if len(active_datanodes) < 2:
             raise HTTPException(status_code=503, detail="No hay suficientes DataNodes disponibles (se requieren al menos 2)")
             
-        # Crear entrada del archivo
+        # Crear entrada del archivo en estado UPLOADING
         try:
             if parent_id is None:
-                cursor.execute("INSERT INTO files (user_id, parent_id, name, is_dir, size_bytes) VALUES (?, NULL, ?, 0, ?)", (user_id, file_name, req.file_size))
+                cursor.execute("INSERT INTO files (user_id, parent_id, name, is_dir, size_bytes, status) VALUES (?, NULL, ?, 0, ?, 'UPLOADING')", (user_id, file_name, req.file_size))
             else:
-                cursor.execute("INSERT INTO files (user_id, parent_id, name, is_dir, size_bytes) VALUES (?, ?, ?, 0, ?)", (user_id, parent_id, file_name, req.file_size))
+                cursor.execute("INSERT INTO files (user_id, parent_id, name, is_dir, size_bytes, status) VALUES (?, ?, ?, 0, ?, 'UPLOADING')", (user_id, parent_id, file_name, req.file_size))
             file_id = cursor.lastrowid
         except sqlite3.IntegrityError:
             raise HTTPException(status_code=400, detail="El archivo ya existe. Utilice 'rm' primero para sobrescribir.")
@@ -226,8 +226,8 @@ def allocate_blocks(req: AllocateReq, user_id: int = Depends(get_current_user_id
             
             cursor.execute("INSERT INTO blocks (file_id, block_index, block_id, size_bytes) VALUES (?, ?, ?, ?)", (file_id, i, block_id, block_size))
             
-            # Asignar a 2 DataNodes distintos aleatoriamente
-            selected_dns = random.sample(active_datanodes, 2)
+            # Asignar a los 2 DataNodes con más espacio
+            selected_dns = active_datanodes[:2]
             for dn in selected_dns:
                 cursor.execute("INSERT INTO block_locations (block_id, datanode_id) VALUES (?, ?)", (block_id, dn["datanode_id"]))
                 
@@ -240,6 +240,30 @@ def allocate_blocks(req: AllocateReq, user_id: int = Depends(get_current_user_id
             
         conn.commit()
         return {"blocks": allocated_blocks}
+
+@app.post("/files/commit")
+def commit_file(req: PathReq, user_id: int = Depends(get_current_user_id)):
+    parts = [p for p in req.path.split("/") if p]
+    if not parts:
+        raise HTTPException(status_code=400, detail="Ruta inválida")
+    
+    file_name = parts[-1]
+    parent_path = "/" + "/".join(parts[:-1]) if len(parts) > 1 else "/"
+    
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        parent_id = get_parent_dir_id(cursor, user_id, parent_path)
+        
+        if parent_id is None:
+            cursor.execute("UPDATE files SET status='READY' WHERE user_id=? AND parent_id IS NULL AND name=? AND is_dir=0", (user_id, file_name))
+        else:
+            cursor.execute("UPDATE files SET status='READY' WHERE user_id=? AND parent_id=? AND name=? AND is_dir=0", (user_id, parent_id, file_name))
+            
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Archivo no encontrado o ya confirmado")
+            
+        conn.commit()
+        return {"message": "Archivo confirmado exitosamente"}
 
 # ==================== FILE DOWNLOAD (GET) ====================
 @app.post("/files/locations")
@@ -256,9 +280,9 @@ def get_file_locations(req: PathReq, user_id: int = Depends(get_current_user_id)
         parent_id = get_parent_dir_id(cursor, user_id, parent_path)
         
         if parent_id is None:
-            cursor.execute("SELECT id FROM files WHERE user_id=? AND parent_id IS NULL AND name=? AND is_dir=0", (user_id, file_name))
+            cursor.execute("SELECT id FROM files WHERE user_id=? AND parent_id IS NULL AND name=? AND is_dir=0 AND status='READY'", (user_id, file_name))
         else:
-            cursor.execute("SELECT id FROM files WHERE user_id=? AND parent_id=? AND name=? AND is_dir=0", (user_id, parent_id, file_name))
+            cursor.execute("SELECT id FROM files WHERE user_id=? AND parent_id=? AND name=? AND is_dir=0 AND status='READY'", (user_id, parent_id, file_name))
             
         row = cursor.fetchone()
         if not row:
