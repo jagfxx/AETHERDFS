@@ -1,6 +1,8 @@
 import sys
 import os
 import requests
+import getpass
+import hashlib
 from typing import Dict, Optional
 
 NAMENODE_URL = os.environ.get("NAMENODE_URL", "http://localhost:8000")
@@ -90,6 +92,7 @@ def cd(path):
         CURRENT_DIR = "/"
         return
         
+    # Verificar que el directorio existe listándolo
     res = requests.post(f"{NAMENODE_URL}/ls", json={"path": full_path}, headers=headers())
     if res.status_code == 200:
         CURRENT_DIR = full_path
@@ -136,6 +139,58 @@ def put(local_path, remote_path):
                     
     print("Transferencia completada.")
 
+def get(remote_path, local_path):
+    full_remote_path = resolve_path(remote_path)
+    
+    # 1. Obtener ubicaciones
+    res = requests.post(f"{NAMENODE_URL}/files/locations", json={"path": full_remote_path}, headers=headers())
+    if res.status_code != 200:
+        print(f"Error ubicando archivo: {res.json().get('detail')}")
+        return
+        
+    blocks = res.json()["blocks"]
+    print(f"Descargando {len(blocks)} bloques...")
+    
+    with open(local_path, "wb") as f:
+        for b in blocks:
+            block_id = b["block_id"]
+            locations = b["locations"]
+            
+            downloaded = False
+            for node in locations:
+                target_url = f"http://{node['host']}:{node['port']}/blocks/{block_id}"
+                try:
+                    print(f"Descargando bloque {block_id[:8]} desde {node['host']}...")
+                    md5_hash = hashlib.md5()
+                    tmp_block = local_path + f".{block_id}.tmp"
+                    
+                    with requests.get(target_url, stream=True) as r:
+                        r.raise_for_status()
+                        with open(tmp_block, "wb") as temp_f:
+                            for chunk in r.iter_content(chunk_size=8192):
+                                temp_f.write(chunk)
+                                md5_hash.update(chunk)
+                                
+                    if b.get("checksum") and md5_hash.hexdigest() != b["checksum"]:
+                        print(f"⚠️ Bloque corrupto detectado en {node['host']} (MD5 mismatch). Saltando a la réplica...")
+                        os.remove(tmp_block)
+                        continue
+                        
+                    with open(tmp_block, "rb") as temp_f:
+                        f.write(temp_f.read())
+                    os.remove(tmp_block)
+                    
+                    downloaded = True
+                    break # Salimos si descargó bien
+                except Exception as e:
+                    print(f"Error descargando de {node['host']}: {e}. Intentando réplica...")
+            
+            if not downloaded:
+                print("Error crítico: No se pudo descargar el bloque de ninguna réplica.")
+                return
+                
+    print(f"Archivo guardado en {local_path}")
+
 def print_help():
     print("""
 Comandos disponibles:
@@ -147,6 +202,7 @@ Comandos disponibles:
   rmdir <path>
   rm <path>
   put <local_file> <remote_path>
+  get <remote_path> <local_file>
   help
   exit
 """)
@@ -173,6 +229,7 @@ def main():
             elif cmd == "rmdir" and len(args) == 1: rmdir(args[0])
             elif cmd == "rm" and len(args) == 1: rm(args[0])
             elif cmd == "put" and len(args) == 2: put(args[0], args[1])
+            elif cmd == "get" and len(args) == 2: get(args[0], args[1])
             else:
                 print("Comando inválido o argumentos incorrectos. Escribe 'help'.")
         except (EOFError, KeyboardInterrupt):
