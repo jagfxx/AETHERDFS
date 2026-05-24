@@ -1,0 +1,14 @@
+.antigravitycli/
+.gemini/
+venv/
+env/
+__pycache__/
+*.pyc
+.env
+taller.md
+PreInforme_DFS_*.md
+walkthrough.md
+*.sqlite3
+*.db
+/namenode/data/
+/datanode/data/
