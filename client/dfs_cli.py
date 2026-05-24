@@ -1,223 +1,188 @@
-import sys
 import os
-import requests
-import getpass
+import sys
+import posixpath
 import hashlib
 import concurrent.futures
+import requests
 from typing import Dict, Optional
 
 NAMENODE_URL = os.environ.get("NAMENODE_URL", "http://localhost:8000")
-BLOCK_SIZE_MB = int(os.environ.get("BLOCK_SIZE_MB", 64))
-BLOCK_SIZE_BYTES = BLOCK_SIZE_MB * 1024 * 1024
+BLOCK_SIZE_BYTES = int(os.environ.get("BLOCK_SIZE_MB", 64)) * 1024 * 1024
 
 TOKEN: Optional[str] = None
 CURRENT_DIR = "/"
 
+
 def headers() -> Dict[str, str]:
     if not TOKEN:
-        print("Error: No estás autenticado. Usa 'login' o 'register'.")
-        sys.exit(1)
+        raise SystemExit("No estás autenticado. Usa 'login' o 'register'.")
     return {"Authorization": f"Bearer {TOKEN}"}
 
+
 def resolve_path(path: str) -> str:
-    if path.startswith("/"):
-        return path
-    if CURRENT_DIR == "/":
-        return "/" + path
-    return CURRENT_DIR + "/" + path
+    if not path.startswith("/"):
+        path = posixpath.join(CURRENT_DIR, path)
+    return posixpath.normpath(path)
+
+
+def _post(endpoint: str, payload: dict, auth: bool = True):
+    h = headers() if auth else {}
+    return requests.post(f"{NAMENODE_URL}{endpoint}", json=payload, headers=h)
+
+
+def _detail(r):
+    try:
+        return r.json().get("detail", r.text)
+    except Exception:
+        return r.text
+
 
 def register(username, password):
-    res = requests.post(f"{NAMENODE_URL}/register", json={"username": username, "password": password})
-    if res.status_code == 200:
-        print("Registro exitoso. Ahora puedes hacer login.")
-    else:
-        print(f"Error: {res.json().get('detail')}")
+    r = _post("/register", {"username": username, "password": password}, auth=False)
+    print("Registro exitoso." if r.ok else f"Error: {_detail(r)}")
+
 
 def login(username, password):
     global TOKEN
-    res = requests.post(f"{NAMENODE_URL}/login", json={"username": username, "password": password})
-    if res.status_code == 200:
-        TOKEN = res.json()["access_token"]
+    r = _post("/login", {"username": username, "password": password}, auth=False)
+    if r.ok:
+        TOKEN = r.json()["access_token"]
         print("Autenticación exitosa.")
     else:
-        print("Error en credenciales.")
+        print("Credenciales inválidas.")
 
-def mkdir(path):
-    full_path = resolve_path(path)
-    res = requests.post(f"{NAMENODE_URL}/mkdir", json={"path": full_path}, headers=headers())
-    if res.status_code == 200:
-        print(f"Directorio creado: {full_path}")
-    else:
-        print(f"Error: {res.json().get('detail')}")
 
-def rmdir(path):
-    full_path = resolve_path(path)
-    res = requests.post(f"{NAMENODE_URL}/rmdir", json={"path": full_path}, headers=headers())
-    if res.status_code == 200:
-        print(f"Directorio eliminado: {full_path}")
-    else:
-        print(f"Error: {res.json().get('detail')}")
+def _cmd(endpoint, path, ok_msg):
+    target = resolve_path(path)
+    r = _post(endpoint, {"path": target})
+    print(f"{ok_msg}: {target}" if r.ok else f"Error: {_detail(r)}")
 
-def rm(path):
-    full_path = resolve_path(path)
-    res = requests.post(f"{NAMENODE_URL}/rm", json={"path": full_path}, headers=headers())
-    if res.status_code == 200:
-        print(f"Archivo eliminado: {full_path}")
-    else:
-        print(f"Error: {res.json().get('detail')}")
+
+def mkdir(path): _cmd("/mkdir", path, "Directorio creado")
+def rmdir(path): _cmd("/rmdir", path, "Directorio eliminado")
+def rm(path):    _cmd("/rm", path, "Archivo eliminado")
+
 
 def ls(path=""):
-    full_path = resolve_path(path) if path else CURRENT_DIR
-    res = requests.post(f"{NAMENODE_URL}/ls", json={"path": full_path}, headers=headers())
-    if res.status_code == 200:
-        items = res.json()
-        if not items:
-            print("(vacío)")
-        for item in items:
-            tipo = "DIR " if item['is_dir'] else "FILE"
-            size = item['size'] / (1024*1024)
-            print(f"[{tipo}] {item['name']} ({size:.2f} MB)")
-    else:
-        print(f"Error: {res.json().get('detail')}")
+    target = resolve_path(path) if path else CURRENT_DIR
+    r = _post("/ls", {"path": target})
+    if not r.ok:
+        print(f"Error: {_detail(r)}")
+        return
+    items = r.json()
+    if not items:
+        print("(vacío)")
+        return
+    for it in items:
+        tipo = "DIR " if it["is_dir"] else "FILE"
+        print(f"[{tipo}] {it['name']} ({it['size'] / (1024*1024):.2f} MB)")
+
 
 def cd(path):
     global CURRENT_DIR
-    if path == "..":
-        if CURRENT_DIR != "/":
-            CURRENT_DIR = "/" + "/".join([p for p in CURRENT_DIR.split("/") if p][:-1])
-            if not CURRENT_DIR: CURRENT_DIR = "/"
-        return
-
-    full_path = resolve_path(path)
-    if full_path == "/":
+    target = resolve_path(path)
+    if target == "/":
         CURRENT_DIR = "/"
         return
-        
-    # Verificar que el directorio existe listándolo
-    res = requests.post(f"{NAMENODE_URL}/ls", json={"path": full_path}, headers=headers())
-    if res.status_code == 200:
-        CURRENT_DIR = full_path
+    r = _post("/ls", {"path": target})
+    if r.ok:
+        CURRENT_DIR = target
     else:
-        print(f"Directorio no existe: {full_path}")
+        print(f"Directorio no existe: {target}")
+
+
+def _upload_to(node, block_id, data):
+    url = f"http://{node['host']}:{node['port']}/blocks/{block_id}"
+    try:
+        r = requests.post(url, files={"file": (block_id, data)}, headers=headers(), timeout=300)
+        return r.json().get("checksum") if r.ok else None
+    except Exception as e:
+        print(f"  ! fallo en {node['host']}: {e}")
+        return None
+
 
 def put(local_path, remote_path):
     if not os.path.exists(local_path):
         print("Archivo local no existe.")
         return
-        
     file_size = os.path.getsize(local_path)
-    full_remote_path = resolve_path(remote_path)
-    
-    # 1. Asignar bloques (Fase 1: UPLOADING)
-    res = requests.post(f"{NAMENODE_URL}/files/allocate", json={"path": full_remote_path, "file_size": file_size}, headers=headers())
-    if res.status_code != 200:
-        print(f"Error asignando bloques: {res.json().get('detail')}")
+    remote = resolve_path(remote_path)
+
+    r = _post("/files/allocate", {"path": remote, "file_size": file_size})
+    if not r.ok:
+        print(f"Error asignando bloques: {_detail(r)}")
         return
-        
-    blocks = res.json()["blocks"]
-    print(f"Asignados {len(blocks)} bloques para {full_remote_path}.")
-    
-    def upload_block_to_node(node, block_id, data_chunk):
-        target_url = f"http://{node['host']}:{node['port']}/blocks/{block_id}"
-        print(f"Subiendo bloque {block_id[:8]} a {node['host']}...")
-        try:
-            upload_res = requests.post(target_url, files={"file": (block_id, data_chunk)})
-            if upload_res.status_code != 200:
-                print(f"Advertencia: Falló subida a {node['host']}.")
-                return False
-            return True
-        except Exception as e:
-            print(f"Advertencia: Nodo {node['host']} inaccesible ({e}).")
-            return False
-            
-    # 2. Enviar los bloques concurrentemente
+    blocks = r.json()["blocks"]
+    print(f"Asignados {len(blocks)} bloques.")
+
+    success = True
+    checksums = {}
     with open(local_path, "rb") as f:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            block_futures = {}
-            for b in blocks:
-                data_chunk = f.read(BLOCK_SIZE_BYTES)
-                if not data_chunk:
-                    break
-                block_id = b["block_id"]
-                block_futures[block_id] = [
-                    executor.submit(upload_block_to_node, b["primary"], block_id, data_chunk),
-                    executor.submit(upload_block_to_node, b["replica"], block_id, data_chunk)
-                ]
-            
-            success = True
-            for block_id, futures in block_futures.items():
-                results = [future.result() for future in futures]
-                if not any(results):
-                    success = False
-                    break
-                    
-    # 3. Commit (Fase 2: READY)
+        for b in blocks:
+            data = f.read(BLOCK_SIZE_BYTES)
+            block_id = b["block_id"]
+            replicas = b["replicas"]
+            print(f"  → {block_id[:8]} a {[n['host'] for n in replicas]}")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(replicas)) as ex:
+                results = list(ex.map(lambda n: _upload_to(n, block_id, data), replicas))
+            if not all(results):
+                print("  ✗ Falló al menos una réplica (replicación estricta). Abortando.")
+                success = False
+                break
+            checksums[block_id] = results[0]
+
     if success:
-        commit_res = requests.post(f"{NAMENODE_URL}/files/commit", json={"path": full_remote_path}, headers=headers())
-        if commit_res.status_code == 200:
-            print("Transferencia y commit completados exitosamente.")
-        else:
-            print(f"Error en commit: {commit_res.json().get('detail')}")
-            rm(remote_path)
-    else:
-        print("Error crítico: Falló la subida de un bloque a todas sus réplicas. Abortando.")
-        rm(remote_path)
+        r = _post("/files/commit", {"path": remote, "checksums": checksums})
+        if r.ok:
+            print("✓ Subida completa.")
+            return
+        print(f"Error en commit: {_detail(r)}")
+    rm(remote_path)
+
 
 def get(remote_path, local_path):
-    full_remote_path = resolve_path(remote_path)
-    
-    # 1. Obtener ubicaciones
-    res = requests.post(f"{NAMENODE_URL}/files/locations", json={"path": full_remote_path}, headers=headers())
-    if res.status_code != 200:
-        print(f"Error ubicando archivo: {res.json().get('detail')}")
+    remote = resolve_path(remote_path)
+    r = _post("/files/locations", {"path": remote})
+    if not r.ok:
+        print(f"Error: {_detail(r)}")
         return
-        
-    blocks = res.json()["blocks"]
+    blocks = r.json()["blocks"]
     print(f"Descargando {len(blocks)} bloques...")
-    
-    with open(local_path, "wb") as f:
+
+    with open(local_path, "wb") as out:
         for b in blocks:
             block_id = b["block_id"]
-            locations = b["locations"]
-            
+            expected = b.get("checksum")
+            start = out.tell()
             downloaded = False
-            for node in locations:
-                target_url = f"http://{node['host']}:{node['port']}/blocks/{block_id}"
+            for node in b["locations"]:
+                url = f"http://{node['host']}:{node['port']}/blocks/{block_id}"
+                md5 = hashlib.md5()
                 try:
-                    print(f"Descargando bloque {block_id[:8]} desde {node['host']}...")
-                    md5_hash = hashlib.md5()
-                    tmp_block = local_path + f".{block_id}.tmp"
-                    
-                    with requests.get(target_url, stream=True) as r:
-                        r.raise_for_status()
-                        with open(tmp_block, "wb") as temp_f:
-                            for chunk in r.iter_content(chunk_size=8192):
-                                temp_f.write(chunk)
-                                md5_hash.update(chunk)
-                                
-                    if b.get("checksum") and md5_hash.hexdigest() != b["checksum"]:
-                        print(f" Bloque corrupto detectado en {node['host']} (MD5 mismatch). Saltando a la réplica...")
-                        os.remove(tmp_block)
+                    with requests.get(url, stream=True, headers=headers(), timeout=300) as resp:
+                        resp.raise_for_status()
+                        for chunk in resp.iter_content(chunk_size=65536):
+                            md5.update(chunk)
+                            out.write(chunk)
+                    if expected and md5.hexdigest() != expected:
+                        print(f"  ! MD5 mismatch en {node['host']}, intentando réplica")
+                        out.seek(start)
+                        out.truncate()
                         continue
-                        
-                    with open(tmp_block, "rb") as temp_f:
-                        f.write(temp_f.read())
-                    os.remove(tmp_block)
-                    
                     downloaded = True
-                    break # Salimos si descargó bien
+                    break
                 except Exception as e:
-                    print(f"Error descargando de {node['host']}: {e}. Intentando réplica...")
-            
+                    print(f"  ! error en {node['host']}: {e}")
+                    out.seek(start)
+                    out.truncate()
             if not downloaded:
-                print("Error crítico: No se pudo descargar el bloque de ninguna réplica.")
+                print("✗ No se pudo descargar el bloque de ninguna réplica.")
                 return
-                
-    print(f"Archivo guardado en {local_path}")
+    print(f"✓ Archivo guardado en {local_path}")
 
-def print_help():
-    print("""
-Comandos disponibles:
+
+HELP = """
+Comandos:
   register <user> <pass>
   login <user> <pass>
   ls [path]
@@ -225,42 +190,41 @@ Comandos disponibles:
   mkdir <path>
   rmdir <path>
   rm <path>
-  put <local_file> <remote_path>
-  get <remote_path> <local_file>
+  put <local> <remoto>
+  get <remoto> <local>
   help
   exit
-""")
+"""
+
 
 def main():
-    print("=== DFS Minimalista CLI ===")
-    print("Escribe 'help' para ver los comandos.")
-    
+    print("=== DFS Minimalista CLI ===\nEscribe 'help' para ver los comandos.")
+    funcs = {
+        "register": register, "login": login, "ls": ls, "cd": cd,
+        "mkdir": mkdir, "rmdir": rmdir, "rm": rm, "put": put, "get": get,
+        "help": lambda: print(HELP),
+    }
     while True:
         try:
-            cmd_line = input(f"DFS {CURRENT_DIR} > ").strip().split()
-            if not cmd_line: continue
-            
-            cmd = cmd_line[0]
-            args = cmd_line[1:]
-            
-            if cmd == "exit": break
-            elif cmd == "help": print_help()
-            elif cmd == "register" and len(args) == 2: register(args[0], args[1])
-            elif cmd == "login" and len(args) == 2: login(args[0], args[1])
-            elif cmd == "ls": ls(args[0] if args else "")
-            elif cmd == "cd" and len(args) == 1: cd(args[0])
-            elif cmd == "mkdir" and len(args) == 1: mkdir(args[0])
-            elif cmd == "rmdir" and len(args) == 1: rmdir(args[0])
-            elif cmd == "rm" and len(args) == 1: rm(args[0])
-            elif cmd == "put" and len(args) == 2: put(args[0], args[1])
-            elif cmd == "get" and len(args) == 2: get(args[0], args[1])
-            else:
-                print("Comando inválido o argumentos incorrectos. Escribe 'help'.")
+            parts = input(f"DFS {CURRENT_DIR} > ").strip().split()
+            if not parts:
+                continue
+            cmd, *args = parts
+            if cmd == "exit":
+                break
+            if cmd not in funcs:
+                print("Comando inválido. 'help' para ver opciones.")
+                continue
+            try:
+                funcs[cmd](*args)
+            except TypeError:
+                print("Argumentos incorrectos.")
         except (EOFError, KeyboardInterrupt):
             print()
             break
         except Exception as e:
-            print(f"Error inesperado: {e}")
+            print(f"Error: {e}")
+
 
 if __name__ == "__main__":
     main()

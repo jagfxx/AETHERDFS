@@ -1,140 +1,131 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Security
 from fastapi.responses import FileResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from contextlib import asynccontextmanager
 import os
-import shutil
 import asyncio
-import requests
 import logging
 import hashlib
+import jwt
+import httpx
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("DataNode")
+log = logging.getLogger("DataNode")
 
-app = FastAPI(title="DFS DataNode")
-
-DATANODE_ID = os.environ.get("DATANODE_ID", "dn_dev")
-NAMENODE_URL = os.environ.get("NAMENODE_URL", "http://localhost:8000")
-DATA_DIR = "/app/data"
-
-os.makedirs(DATA_DIR, exist_ok=True)
-
-# Por defecto asumimos el nombre del contenedor en Docker Compose y puerto 8000 interno
-# Pero permitimos variables de entorno para pruebas desde el host local
+DATANODE_ID = os.environ["DATANODE_ID"]
+NAMENODE_URL = os.environ["NAMENODE_URL"]
+CLUSTER_TOKEN = os.environ["CLUSTER_TOKEN"]
+JWT_SECRET = os.environ["JWT_SECRET"]
 MY_HOST = os.environ.get("REPORTED_HOST", DATANODE_ID)
 MY_PORT = int(os.environ.get("REPORTED_PORT", 8000))
+DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-@app.on_event("startup")
-async def startup_event():
-    logger.info(f"Iniciando DataNode {DATANODE_ID} - Reportando a {NAMENODE_URL}")
-    asyncio.create_task(heartbeat_loop())
+security = HTTPBearer()
+
+
+def require_auth(creds: HTTPAuthorizationCredentials = Security(security)):
+    tok = creds.credentials
+    if tok == CLUSTER_TOKEN:
+        return
+    try:
+        jwt.decode(tok, JWT_SECRET, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        raise HTTPException(401, "Token inválido")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info(f"DataNode {DATANODE_ID} → {NAMENODE_URL}")
+    task = asyncio.create_task(heartbeat_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
+app = FastAPI(title="DFS DataNode", lifespan=lifespan)
+
 
 async def heartbeat_loop():
-    while True:
-        try:
-            # Obtener espacio libre (muy básico para simular en Linux)
-            st = os.statvfs(DATA_DIR)
-            free_bytes = st.f_bavail * st.f_frsize
-            
-            # Generar Block Report
-            blocks_report = []
-            for f_name in os.listdir(DATA_DIR):
-                if not f_name.endswith(".md5"):
-                    md5_file = os.path.join(DATA_DIR, f_name + ".md5")
-                    checksum = ""
-                    if os.path.exists(md5_file):
-                        with open(md5_file, "r") as f:
-                            checksum = f.read().strip()
-                    blocks_report.append({"id": f_name, "checksum": checksum})
-            
-            payload = {
-                "datanode_id": DATANODE_ID,
-                "ip_address": MY_HOST,
-                "port": MY_PORT,
-                "free_bytes": free_bytes,
-                "blocks": blocks_report
-            }
-            
-            # Bloqueamos un momento en requests, es un hack simple para no usar aiohttp
-            # En un entorno real se usaría httpx asíncrono, pero requests sirve para DFS minimalista
-            response = requests.post(f"{NAMENODE_URL}/datanodes/heartbeat", json=payload, timeout=2)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("delete_blocks"):
-                    for b_id in data["delete_blocks"]:
-                        delete_local_block(b_id)
-                if data.get("replicate_blocks"):
-                    for rep in data["replicate_blocks"]:
+    hdrs = {"Authorization": f"Bearer {CLUSTER_TOKEN}"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        while True:
+            try:
+                st = os.statvfs(DATA_DIR)
+                payload = {
+                    "datanode_id": DATANODE_ID, "ip_address": MY_HOST, "port": MY_PORT,
+                    "free_bytes": st.f_bavail * st.f_frsize,
+                }
+                r = await client.post(f"{NAMENODE_URL}/datanodes/heartbeat", json=payload, headers=hdrs)
+                if r.status_code == 200:
+                    for rep in r.json().get("replicate_blocks", []):
                         asyncio.create_task(replicate_block(rep["block_id"], rep["source_url"]))
-        except Exception as e:
-            logger.error(f"Fallo al enviar heartbeat al NameNode: {e}")
-            
-        await asyncio.sleep(5)
+            except Exception as e:
+                log.error(f"heartbeat fallo: {e}")
+            await asyncio.sleep(5)
 
-def delete_local_block(block_id: str):
-    file_path = os.path.join(DATA_DIR, block_id)
-    md5_path = file_path + ".md5"
-    if os.path.exists(file_path):
-        os.remove(file_path)
-        logger.info(f"Bloque {block_id} eliminado (Garbage Collection)")
-    if os.path.exists(md5_path):
-        os.remove(md5_path)
 
 async def replicate_block(block_id: str, source_url: str):
-    logger.info(f"Replicando bloque {block_id} desde {source_url}...")
+    path = os.path.join(DATA_DIR, block_id)
+    md5_path = path + ".md5"
+    md5 = hashlib.md5()
+    hdrs = {"Authorization": f"Bearer {CLUSTER_TOKEN}"}
     try:
-        file_path = os.path.join(DATA_DIR, block_id)
-        md5_path = file_path + ".md5"
-        
-        md5_hash = hashlib.md5()
-        with requests.get(source_url, stream=True, timeout=10) as r:
-            r.raise_for_status()
-            with open(file_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-                    md5_hash.update(chunk)
-                    
-        with open(md5_path, "w") as f:
-            f.write(md5_hash.hexdigest())
-        logger.info(f"Réplica completada: {block_id}")
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("GET", source_url, headers=hdrs) as r:
+                r.raise_for_status()
+                with open(path, "wb") as f:
+                    async for chunk in r.aiter_bytes(65536):
+                        md5.update(chunk)
+                        f.write(chunk)
+            with open(md5_path, "w") as f:
+                f.write(md5.hexdigest())
+            await client.post(
+                f"{NAMENODE_URL}/blocks/{block_id}/locations",
+                json={"datanode_id": DATANODE_ID}, headers=hdrs,
+            )
+        log.info(f"Réplica creada: {block_id}")
     except Exception as e:
-        logger.error(f"Fallo replicando {block_id}: {e}")
+        for p in (path, md5_path):
+            if os.path.exists(p):
+                os.remove(p)
+        log.error(f"replicación fallida {block_id}: {e}")
+
 
 @app.get("/health")
-def health_check():
+def health():
     return {"status": "ok", "datanode_id": DATANODE_ID}
 
+
 @app.post("/blocks/{block_id}")
-async def upload_block(block_id: str, file: UploadFile = File(...)):
-    """Recibe un bloque del cliente y lo guarda físicamente calculando MD5"""
-    file_path = os.path.join(DATA_DIR, block_id)
-    md5_path = file_path + ".md5"
+async def upload_block(block_id: str, file: UploadFile = File(...), _=Depends(require_auth)):
+    path = os.path.join(DATA_DIR, block_id)
+    md5_path = path + ".md5"
+    md5 = hashlib.md5()
     try:
-        md5_hash = hashlib.md5()
-        with open(file_path, "wb") as buffer:
+        with open(path, "wb") as f:
             while True:
-                chunk = file.file.read(8192)
+                chunk = await file.read(65536)
                 if not chunk:
                     break
-                md5_hash.update(chunk)
-                buffer.write(chunk)
-                
+                md5.update(chunk)
+                f.write(chunk)
         with open(md5_path, "w") as f:
-            f.write(md5_hash.hexdigest())
-            
-        logger.info(f"Bloque guardado exitosamente: {block_id} (MD5: {md5_hash.hexdigest()})")
-        return {"message": "Bloque guardado exitosamente", "checksum": md5_hash.hexdigest()}
+            f.write(md5.hexdigest())
+        log.info(f"Bloque guardado: {block_id}")
+        return {"checksum": md5.hexdigest()}
     except Exception as e:
-        logger.error(f"Error guardando bloque {block_id}: {e}")
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        if os.path.exists(md5_path):
-            os.remove(md5_path)
-        raise HTTPException(status_code=500, detail="Error interno al guardar el bloque")
+        for p in (path, md5_path):
+            if os.path.exists(p):
+                os.remove(p)
+        log.error(f"upload fallido {block_id}: {e}")
+        raise HTTPException(500, "Error al guardar bloque")
+
 
 @app.get("/blocks/{block_id}")
-def download_block(block_id: str):
-    """Sirve el bloque físico al cliente"""
-    file_path = os.path.join(DATA_DIR, block_id)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Bloque no encontrado en este DataNode")
-    return FileResponse(file_path, media_type="application/octet-stream", filename=block_id)
+def download_block(block_id: str, _=Depends(require_auth)):
+    path = os.path.join(DATA_DIR, block_id)
+    if not os.path.exists(path):
+        raise HTTPException(404, "Bloque no encontrado")
+    return FileResponse(path, media_type="application/octet-stream", filename=block_id)

@@ -1,11 +1,20 @@
 version: '3.8'
 
+x-cluster-env: &cluster-env
+  JWT_SECRET: ${JWT_SECRET:-changeme-dev-secret}
+  CLUSTER_TOKEN: ${CLUSTER_TOKEN:-changeme-dev-cluster}
+
+x-datanode-healthcheck: &dn-healthcheck
+  test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+  interval: 10s
+  timeout: 5s
+  retries: 3
+
 services:
   namenode:
-    build:
-      context: ./namenode
+    build: ./namenode
     environment:
-      - JWT_SECRET=super_secret_key_dfs_2026
+      <<: *cluster-env
     ports:
       - "8000:8000"
     volumes:
@@ -17,14 +26,14 @@ services:
       retries: 3
 
   datanode1:
-    build:
-      context: ./datanode
+    build: ./datanode
     environment:
-      - DATANODE_ID=dn1
-      - NAMENODE_URL=http://namenode:8000
-      - REPORTED_HOST=localhost
-      - REPORTED_PORT=8001
-      - BLOCK_SIZE_MB=64
+      <<: *cluster-env
+      DATANODE_ID: datanode1
+      NAMENODE_URL: http://namenode:8000
+      REPORTED_HOST: localhost
+      REPORTED_PORT: 8001
+      BLOCK_SIZE_MB: 64
     ports:
       - "8001:8000"
     volumes:
@@ -32,16 +41,17 @@ services:
     depends_on:
       namenode:
         condition: service_healthy
+    healthcheck: *dn-healthcheck
 
   datanode2:
-    build:
-      context: ./datanode
+    build: ./datanode
     environment:
-      - DATANODE_ID=dn2
-      - NAMENODE_URL=http://namenode:8000
-      - REPORTED_HOST=localhost
-      - REPORTED_PORT=8002
-      - BLOCK_SIZE_MB=64
+      <<: *cluster-env
+      DATANODE_ID: datanode2
+      NAMENODE_URL: http://namenode:8000
+      REPORTED_HOST: localhost
+      REPORTED_PORT: 8002
+      BLOCK_SIZE_MB: 64
     ports:
       - "8002:8000"
     volumes:
@@ -49,16 +59,17 @@ services:
     depends_on:
       namenode:
         condition: service_healthy
+    healthcheck: *dn-healthcheck
 
   datanode3:
-    build:
-      context: ./datanode
+    build: ./datanode
     environment:
-      - DATANODE_ID=dn3
-      - NAMENODE_URL=http://namenode:8000
-      - REPORTED_HOST=localhost
-      - REPORTED_PORT=8003
-      - BLOCK_SIZE_MB=64
+      <<: *cluster-env
+      DATANODE_ID: datanode3
+      NAMENODE_URL: http://namenode:8000
+      REPORTED_HOST: localhost
+      REPORTED_PORT: 8003
+      BLOCK_SIZE_MB: 64
     ports:
       - "8003:8000"
     volumes:
@@ -66,6 +77,7 @@ services:
     depends_on:
       namenode:
         condition: service_healthy
+    healthcheck: *dn-healthcheck
 
 volumes:
   namenode_data:
