@@ -1,0 +1,13 @@
+register admin 123
+login admin 123
+mkdir fotos
+ls
+cd fotos
+put /tmp/test_img.jpg foto1.jpg
+ls
+get foto1.jpg /tmp/descarga.jpg
+rm foto1.jpg
+cd ..
+rmdir fotos
+ls
+exit

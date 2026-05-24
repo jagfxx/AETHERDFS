@@ -1,0 +1,4 @@
+register testuser 123
+login testuser 123
+put /tmp/eval_img.bin test.bin
+exit
