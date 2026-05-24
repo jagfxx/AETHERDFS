@@ -252,3 +252,99 @@ def get_file_locations(req: PathReq, user_id: int = Depends(get_current_user_id)
             })
             
         return {"blocks": result}
+
+# ==================== FILE DELETE (RM) ====================
+@app.post("/rm")
+def remove_file(req: PathReq, user_id: int = Depends(get_current_user_id)):
+    parts = [p for p in req.path.split("/") if p]
+    if not parts:
+        raise HTTPException(status_code=400, detail="Ruta inválida")
+    
+    file_name = parts[-1]
+    parent_path = "/" + "/".join(parts[:-1]) if len(parts) > 1 else "/"
+    
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        parent_id = get_parent_dir_id(cursor, user_id, parent_path)
+        
+        if parent_id is None:
+            cursor.execute("SELECT id FROM files WHERE user_id=? AND parent_id IS NULL AND name=? AND is_dir=0", (user_id, file_name))
+        else:
+            cursor.execute("SELECT id FROM files WHERE user_id=? AND parent_id=? AND name=? AND is_dir=0", (user_id, parent_id, file_name))
+            
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Archivo no encontrado")
+            
+        file_id = row["id"]
+        
+        # Recuperar block_ids y datanodes antes de borrar (para notificar la recolección de basura después)
+        cursor.execute("""
+            SELECT b.block_id, bl.datanode_id 
+            FROM blocks b 
+            LEFT JOIN block_locations bl ON b.block_id = bl.block_id 
+            WHERE b.file_id=?
+        """, (file_id,))
+        blocks_to_delete = cursor.fetchall()
+        
+        # Guardar en una tabla de garbage collection para que los datanodes lo recojan en el heartbeat
+        cursor.execute("CREATE TABLE IF NOT EXISTS garbage (block_id TEXT, datanode_id TEXT, PRIMARY KEY(block_id, datanode_id))")
+        for b in blocks_to_delete:
+            if b["datanode_id"]:
+                cursor.execute("INSERT OR IGNORE INTO garbage (block_id, datanode_id) VALUES (?, ?)", (b["block_id"], b["datanode_id"]))
+                
+        # Borrado en cascada (borra records en files, blocks y block_locations)
+        cursor.execute("DELETE FROM files WHERE id=?", (file_id,))
+        conn.commit()
+        return {"message": "Archivo eliminado exitosamente. Los DataNodes borrarán los bloques físicos pronto."}
+
+# ==================== DATANODE HEARTBEAT ====================
+class BlockReport(BaseModel):
+    id: str
+    checksum: str
+
+class HeartbeatReq(BaseModel):
+    datanode_id: str
+    ip_address: str
+    port: int
+    free_bytes: int
+    blocks: List[BlockReport] = []
+
+@app.post("/datanodes/heartbeat")
+def heartbeat(req: HeartbeatReq):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO datanodes (datanode_id, ip_address, port, last_heartbeat, free_bytes, status)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, 'ACTIVE')
+            ON CONFLICT(datanode_id) DO UPDATE SET 
+            ip_address=excluded.ip_address,
+            port=excluded.port,
+            last_heartbeat=CURRENT_TIMESTAMP,
+            free_bytes=excluded.free_bytes,
+            status='ACTIVE'
+        """, (req.datanode_id, req.ip_address, req.port, req.free_bytes))
+        
+        # Procesar Block Report
+        for b in req.blocks:
+            cursor.execute("INSERT OR IGNORE INTO block_locations (block_id, datanode_id) VALUES (?, ?)", (b.id, req.datanode_id))
+            if b.checksum:
+                cursor.execute("UPDATE blocks SET checksum=? WHERE block_id=? AND (checksum IS NULL OR checksum='')", (b.checksum, b.id))
+                
+        # Comandos de replicación
+        cursor.execute("CREATE TABLE IF NOT EXISTS replicate_cmds (block_id TEXT, source_url TEXT, target_datanode TEXT, PRIMARY KEY(block_id, target_datanode))")
+        cursor.execute("SELECT block_id, source_url FROM replicate_cmds WHERE target_datanode=?", (req.datanode_id,))
+        rep_cmds = [{"block_id": r["block_id"], "source_url": r["source_url"]} for r in cursor.fetchall()]
+        if rep_cmds:
+            cursor.execute("DELETE FROM replicate_cmds WHERE target_datanode=?", (req.datanode_id,))
+        
+        # Chequear si este DataNode tiene comandos de borrado (Garbage Collection)
+        cursor.execute("CREATE TABLE IF NOT EXISTS garbage (block_id TEXT, datanode_id TEXT, PRIMARY KEY(block_id, datanode_id))")
+        cursor.execute("SELECT block_id FROM garbage WHERE datanode_id=?", (req.datanode_id,))
+        garbage = [r["block_id"] for r in cursor.fetchall()]
+        
+        if garbage:
+            cursor.execute("DELETE FROM garbage WHERE datanode_id=?", (req.datanode_id,))
+            
+        conn.commit()
+        return {"status": "ok", "delete_blocks": garbage, "replicate_blocks": rep_cmds}
